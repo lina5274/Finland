@@ -1,156 +1,196 @@
-import logging
 import os
-import sqlite3
-from telebot import TeleBot, types
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
-from langdetect import detect, LangDetectException
+import logging
+from telebot.async_telebot import AsyncTeleBot
+import asyncio
+import psycopg2
 import openai
+from langdetect import detect, LangDetectException
 
-# Настройка детального логирования
+# Настройка логирования
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Токены API (используйте переменные окружения)
+# Токены и ключи API
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+TIMESCALE_CONNECTION_STRING = os.getenv('TIMESCALE_CONNECTION_STRING')
 
-# Проверяем наличие токенов
-if not TELEGRAM_TOKEN or not OPENAI_API_KEY:
-    logging.error("TELEGRAM_TOKEN or OPENAI_API_KEY не заданы.")
+if not TELEGRAM_TOKEN or not OPENAI_API_KEY or not TIMESCALE_CONNECTION_STRING:
+    logging.error("Не все необходимые переменные окружения установлены.")
     exit(1)
 
-# Инициализация OpenAI API
 openai.api_key = OPENAI_API_KEY
 
-# Инициализация бота Telegram
-bot = TeleBot(TELEGRAM_TOKEN)
-
-
-# Создание таблиц для хранения истории сообщений и заказов
-def create_tables():
-    conn = sqlite3.connect('chat_history.db')
+bot = AsyncTeleBot(TELEGRAM_TOKEN)
+async def create_tables():
+    conn = psycopg2.connect(TIMESCALE_CONNECTION_STRING)
     c = conn.cursor()
 
-    # Таблица для истории чата
-    c.execute('''CREATE TABLE IF NOT EXISTS chat_history
-                 (user_id INTEGER, message_role TEXT, message_content TEXT, timestamp TEXT)''')
+    query_create_chat_history_table = """
+    CREATE TABLE IF NOT EXISTS chat_history (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER,
+        message_role TEXT,
+        message_content TEXT,
+        timestamp TIMESTAMPTZ DEFAULT NOW()
+    );
+    """
+    c.execute(query_create_chat_history_table)
 
-    # Таблица для заказов
-    c.execute('''CREATE TABLE IF NOT EXISTS orders
-                 (order_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, product_name TEXT, quantity INTEGER, total_cost REAL, order_date TEXT)''')
+    query_create_hypertable = """
+    SELECT create_hypertable('chat_history', 'timestamp');
+    """
+    c.execute(query_create_hypertable)
+
+    query_create_users_table = """
+    CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        telegram_id INTEGER UNIQUE,
+        name TEXT,
+        language TEXT DEFAULT 'en'
+    );
+    """
+    c.execute(query_create_users_table)
 
     conn.commit()
+    c.close()
     conn.close()
 
-
-# Сохранение сообщения в базу данных
-def save_message(user_id, message_role, message_content):
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    conn = sqlite3.connect('chat_history.db')
+async def save_message(user_id, message_role, message_content):
+    conn = psycopg2.connect(TIMESCALE_CONNECTION_STRING)
     c = conn.cursor()
-    c.execute("INSERT INTO chat_history (user_id, message_role, message_content, timestamp) VALUES (?, ?, ?, ?)",
-              (user_id, message_role, message_content, timestamp))
+
+    query_insert_message = """
+    INSERT INTO chat_history (user_id, message_role, message_content)
+    VALUES (%s, %s, %s);
+    """
+    c.execute(query_insert_message, (user_id, message_role, message_content))
+
     conn.commit()
+    c.close()
     conn.close()
 
-
-# Получение истории сообщений для определенного пользователя
-def get_chat_history(user_id):
-    conn = sqlite3.connect('chat_history.db')
+async def get_chat_history(user_id):
+    conn = psycopg2.connect(TIMESCALE_CONNECTION_STRING)
     c = conn.cursor()
-    c.execute("SELECT message_role, message_content FROM chat_history WHERE user_id=? ORDER BY rowid DESC LIMIT 10",
-              (user_id,))
+
+    query_get_history = """
+    SELECT message_role, message_content FROM chat_history
+    WHERE user_id = %s ORDER BY timestamp DESC LIMIT 10;
+    """
+    c.execute(query_get_history, (user_id,))
+
     chat_history = c.fetchall()
+    c.close()
     conn.close()
     return chat_history[::-1]
 
-
-# Функция для получения информации о товаре из базы данных
-def get_product_info(product_name):
-    conn = sqlite3.connect('products.db')
+async def check_user_exists(user_id):
+    conn = psycopg2.connect(TIMESCALE_CONNECTION_STRING)
     c = conn.cursor()
-    c.execute("SELECT * FROM products WHERE name=?", (product_name,))
-    product_data = c.fetchone()
+
+    query_check_user = """
+    SELECT * FROM users WHERE telegram_id = %s;
+    """
+    c.execute(query_check_user, (user_id,))
+
+    user_exists = bool(c.fetchone())
+    c.close()
     conn.close()
-    return product_data
+    return user_exists
 
-
-# Определение языка пользователя по последнему сообщению
-def get_user_language(user_id):
-    conn = sqlite3.connect('chat_history.db')
+async def save_user(user_id, name):
+    conn = psycopg2.connect(TIMESCALE_CONNECTION_STRING)
     c = conn.cursor()
-    c.execute(
-        "SELECT message_content FROM chat_history WHERE user_id=? AND message_role='user' ORDER BY rowid DESC LIMIT 1",
-        (user_id,))
-    result = c.fetchone()
+
+    query_insert_user = """
+    INSERT INTO users (telegram_id, name)
+    VALUES (%s, %s);
+    """
+    c.execute(query_insert_user, (user_id, name))
+
+    conn.commit()
+    c.close()
     conn.close()
-    if result:
-        last_message = result[0]
-        try:
-            language = detect(last_message)
-        except LangDetectException:
-            language = 'en'
-    else:
-        language = 'en'
-    return language
+
+async def update_user_language(user_id, language):
+    conn = psycopg2.connect(TIMESCALE_CONNECTION_STRING)
+    c = conn.cursor()
+
+    query_update_language = """
+    UPDATE users SET language = %s WHERE telegram_id = %s;
+    """
+    c.execute(query_update_language, (language, user_id))
+
+    conn.commit()
+    c.close()
+    conn.close()
+async def get_ai_response(user_id, message):
+    chat_history = await get_chat_history(user_id)
+
+    messages = [
+        {"role": role, "content": content} for role, content in chat_history
+    ]
+
+    user_info_query = """
+    SELECT name, language FROM users WHERE telegram_id = %s;
+    """
+    conn = psycopg2.connect(TIMESCALE_CONNECTION_STRING)
+    c = conn.cursor()
+    c.execute(user_info_query, (user_id,))
+    user_info = c.fetchone()
+    c.close()
+    conn.close()
+
+    system_messages = {
+        'ru': f"Вы помощник-продавец. Помните историю разговора и отвечайте осознанно. Отвечайте на том же языке, на котором задают вопрос. Пользователь: {user_info[0]}",
+        'en': f"You are a sales assistant. Remember the conversation and answer thoughtfully. Reply in the same language as the user's message. User: {user_info[0]}"
+    }
+    messages.insert(0, {"role": "system", "content": system_messages[user_info[1]]})
+
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=messages,
+        max_tokens=500,
+        temperature=0.7,
+    )
+    return response.choices[0].message.content
+
+async def save_ai_response(user_id, ai_response):
+    await save_message(user_id, 'ai', ai_response)
 
 
-# Функция для обработки заказа
-def process_order(message):
+async def process_message(message):
     try:
         # Сохранение сообщения пользователя
-        save_message(message.chat.id, 'user', message.text)
+        await save_message(message.chat.id, 'user', message.text)
 
-        # Определение языка сообщения
+        # Проверка существования пользователя
+        if not await check_user_exists(message.chat.id):
+            await save_user(message.chat.id, message.from_user.first_name)
+
+        # Определение языка пользователя с использованием значения по умолчанию
+        user_language = 'en'  # Значение по умолчанию
+
         try:
-            user_language = detect(message.text)
+            detected_language = detect(message.text)
+            if detected_language == 'ru':
+                user_language = 'ru'
+            elif detected_language != 'en':
+                logging.warning(f"Detected language '{detected_language}' is not supported. Using default 'en'.")
         except LangDetectException:
-            user_language = 'en'
+            logging.warning(f"Failed to detect language for message: {message.text}")
 
-        # Получение истории сообщений
-        chat_history = get_chat_history(message.chat.id)
-        messages = [
-            {"role": role, "content": content} for role, content in chat_history
-        ]
+        # Обновление языка пользователя в базе данных
+        await update_user_language(message.chat.id, user_language)
 
-        # Добавляем системное сообщение
-        system_messages = {
-            'ru': "Вы помощник-продавец. Помните историю разговора и отвечайте осознанно. Отвечайте на том же языке, на котором задают вопрос.",
-            'en': "You are a sales assistant. Remember the conversation and answer thoughtfully. Reply in the same language as the user's message."
-        }
-        messages.insert(0, {"role": "system", "content": system_messages[user_language]})
+        # Получение ответа от ИИ-помощника
+        ai_response = await get_ai_response(message.chat.id, message.text)
 
-        # Получаем информацию о товаре из базы данных
-        product_name = message.text.split()[-1]
-        product_info = get_product_info(product_name)
+        # Сохранение ответа ИИ-помощника в базу данных
+        await save_ai_response(message.chat.id, ai_response)
 
-        # Добавляем информацию о товаре в контекст
-        if product_info:
-            product_context = f"""
-            Товар: {product_info[1]}
-            Описание: {product_info[2]}
-            Цена: {product_info[3]} руб.
-            """
-            messages.append({"role": "system", "content": product_context})
-
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=messages,
-            max_tokens=500,
-            temperature=0.7,
-        )
-        message_text = response.choices[0].message.content
-
-        # Сохранение ответа бота
-        save_message(message.chat.id, 'assistant', message_text)
-
-        bot.send_message(message.chat.id, message_text)
-
-        # Предложение сделать заказ
-        keyboard = types.InlineKeyboardMarkup()
-        buy_button = types.InlineKeyboardButton(text="Купить", callback_data=f"buy_{product_info[1]}")
-        keyboard.add(buy_button)
-        bot.send_message(message.chat.id, "Хотите купить этот товар?", reply_markup=keyboard)
+        # Отправка ответа пользователю
+        await bot.send_message(message.chat.id, ai_response)
 
     except Exception as e:
         logging.error(f"Error processing message: {e}")
@@ -158,63 +198,54 @@ def process_order(message):
             'ru': "Извините, произошла ошибка при обработке вашего запроса.",
             'en': "Sorry, there was an error processing your request."
         }
-        bot.reply_to(message, error_reply[get_user_language(message.chat.id)])
+
+        # Используем значение по умолчанию для user_language
+        default_user_language = 'en'
+
+        # Пытаемся получить язык пользователя из базы данных
+        try:
+            conn = psycopg2.connect(TIMESCALE_CONNECTION_STRING)
+            c = conn.cursor()
+
+            query_get_language = """
+            SELECT language FROM users WHERE telegram_id = %s;
+            """
+            c.execute(query_get_language, (message.chat.id,))
+            user_language = c.fetchone()
+
+            if user_language:
+                default_user_language = user_language[0]
+
+            c.close()
+            conn.close()
+        except Exception as db_e:
+            logging.error(f"Failed to retrieve user language from database: {db_e}")
+
+        await bot.reply_to(message, error_reply[default_user_language])
 
 
-# Обработчик команды /start
+# Асинхронный обработчик команды /start
 @bot.message_handler(commands=['start'])
-def handle_start(message):
+async def handle_start(message):
     logging.debug("Handling /start command")
-    user_language = get_user_language(message.chat.id)
+    await save_message(message.chat.id, 'system', "/start command received")
     greeting_text = {
         'ru': "Привет! Я ваш бот-продавец. Чем могу помочь?",
         'en': "Hello! I'm your sales bot. How can I assist you?"
     }
-    bot.reply_to(message, greeting_text[user_language])
+    await bot.reply_to(message, greeting_text['en'])  # Используем английский по умолчанию
 
-
-# Обработчик личных сообщений
+# Асинхронный обработчик личных сообщений
 @bot.message_handler(func=lambda message: True)
-def handle_private_message(message):
+async def handle_private_message(message):
     logging.debug("Handling private message")
+    await process_message(message)
 
-    # Создаем пул потоков для параллельной обработки сообщений
-    with ThreadPoolExecutor(max_workers=20) as executor:
-        future = executor.submit(process_order, message)
-        future.result()
-
-
-# Обработчик callback запросов
-@bot.callback_query_handler(func=lambda call: True)
-def handle_callback(call):
-    if call.data.startswith('buy_'):
-        product_name = call.data.split('_')[1]
-        product_info = get_product_info(product_name)
-
-        if product_info:
-            order_id = save_order(call.from_user.id, product_name, 1, product_info[3])
-            bot.answer_callback_query(call.id, text="Заказ успешно оформлен!")
-            bot.send_message(call.message.chat.id, f"Ваш заказ #{order_id} на товар '{product_name}' успешно оформлен.")
-        else:
-            bot.answer_callback_query(call.id, text="Извините, произошла ошибка при оформлении заказа.")
-
-
-# Функция для сохранения заказа в базу данных
-def save_order(user_id, product_name, quantity, total_cost):
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    conn = sqlite3.connect('chat_history.db')
-    c = conn.cursor()
-    c.execute("INSERT INTO orders (user_id, product_name, quantity, total_cost, order_date) VALUES (?, ?, ?, ?, ?)",
-              (user_id, product_name, quantity, total_cost, timestamp))
-    order_id = c.lastrowid
-    conn.commit()
-    conn.close()
-    return order_id
-
+# Основная функция для запуска бота
+async def main():
+    await create_tables()
+    logging.info("Запуск бота")
+    await bot.polling(none_stop=True)
 
 if __name__ == "__main__":
-    create_tables()  # Создание таблиц для хранения истории сообщений и заказов
-
-    # Запуск бота
-    logging.info("Запуск бота")
-    bot.infinity_polling()
+    asyncio.run(main())
